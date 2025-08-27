@@ -1,0 +1,65 @@
+⚙️ FLOPs: 47.58 GFLOPs
+| name                           | #elements or shape   |
+|:-------------------------------|:---------------------|
+| model                          | 1.8M                 |
+|  feat_extract                  |  0.4K                |
+|   feat_extract.weight          |   (16, 3, 3, 3)      |
+|   feat_extract.bias            |   (16,)              |
+|  down1                         |  9.2K                |
+|   down1.weight                 |   (16, 64, 3, 3)     |
+|   down1.bias                   |   (16,)              |
+|  demoire1_1                    |  0.6M                |
+|   demoire1_1.conv_layers       |   0.6M               |
+|    demoire1_1.conv_layers.0    |    36.9K             |
+|    demoire1_1.conv_layers.1    |    73.8K             |
+|    demoire1_1.conv_layers.2    |    0.1M              |
+|    demoire1_1.conv_layers.3    |    0.1M              |
+|    demoire1_1.conv_layers.4    |    0.2M              |
+|   demoire1_1.conv_post         |   24.6K              |
+|    demoire1_1.conv_post.weight |    (64, 384, 1, 1)   |
+|    demoire1_1.conv_post.bias   |    (64,)             |
+|  down2                         |  9.2K                |
+|   down2.weight                 |   (16, 64, 3, 3)     |
+|   down2.bias                   |   (16,)              |
+|  demoire2_1                    |  0.6M                |
+|   demoire2_1.conv_layers       |   0.6M               |
+|    demoire2_1.conv_layers.0    |    36.9K             |
+|    demoire2_1.conv_layers.1    |    73.8K             |
+|    demoire2_1.conv_layers.2    |    0.1M              |
+|    demoire2_1.conv_layers.3    |    0.1M              |
+|    demoire2_1.conv_layers.4    |    0.2M              |
+|   demoire2_1.conv_post         |   24.6K              |
+|    demoire2_1.conv_post.weight |    (64, 384, 1, 1)   |
+|    demoire2_1.conv_post.bias   |    (64,)             |
+|  down3                         |  9.2K                |
+|   down3.weight                 |   (16, 64, 3, 3)     |
+|   down3.bias                   |   (16,)              |
+|  demoire3_1                    |  0.6M                |
+|   demoire3_1.conv_layers       |   0.6M               |
+|    demoire3_1.conv_layers.0    |    36.9K             |
+|    demoire3_1.conv_layers.1    |    73.8K             |
+|    demoire3_1.conv_layers.2    |    0.1M              |
+|    demoire3_1.conv_layers.3    |    0.1M              |
+|    demoire3_1.conv_layers.4    |    0.2M              |
+|   demoire3_1.conv_post         |   24.6K              |
+|    demoire3_1.conv_post.weight |    (64, 384, 1, 1)   |
+|    demoire3_1.conv_post.bias   |    (64,)             |
+|  moire_sep1                    |  1                   |
+|   moire_sep1.gamma             |   ()                 |
+|  moire_sep2                    |  1                   |
+|   moire_sep2.gamma             |   ()                 |
+|  moire_sep3                    |  1                   |
+|   moire_sep3.gamma             |   ()                 |
+|  refine1                       |  9.7K                |
+|   refine1.conv                 |   9.7K               |
+|    refine1.conv.0              |    9.2K              |
+|    refine1.conv.2              |    0.4K              |
+|  refine2                       |  9.7K                |
+|   refine2.conv                 |   9.7K               |
+|    refine2.conv.0              |    9.2K              |
+|    refine2.conv.2              |    0.4K              |
+|  refine3                       |  9.7K                |
+|   refine3.conv                 |   9.7K               |
+|    refine3.conv.0              |    9.2K              |
+|    refine3.conv.2              |    0.4K              |
+🚀 Inference time: 5.51 ms
