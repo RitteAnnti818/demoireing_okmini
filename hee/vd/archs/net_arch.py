@@ -10,19 +10,12 @@ from vd.archs.arch_util import DCNv2Pack
     
 
 class AdaptiveArgs:
-    def __init__(self,
-                 random_filter=0,
-                 dc=0,
-                 concat_mode=0,
-                 residual=1,
-                 FSL=0):
-        self.random_filter = random_filter
-        self.dc = dc
-        self.concat_mode = concat_mode
-        self.residual = residual
-        self.FSL = FSL
+    def __init__(self):
+        self.concat_mode = 2
+        self.dc = 1
+        self.random_filter = 1
 
-    
+
 class DilatedBlock(nn.Module):
     def __init__(self, in_channel, d_list, num_feat):
         super(DilatedBlock, self).__init__()
@@ -102,10 +95,101 @@ class FeatureExtract(nn.Module):
     def forward(self, x):
         return self.conv(x)
 
-    
+
+class BasicBlockT(nn.Sequential):
+    r"""The basic block module (Conv+LeakyReLU[+InstanceNorm]).
+    """
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, norm=False):
+        body = [
+            nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=1),
+            nn.LeakyReLU(0.2)
+        ]
+        if norm:
+            body.append(nn.InstanceNorm2d(out_channels, affine=True))
+        super(BasicBlockT, self).__init__(*body)
+
+class TPAMIBackbone(nn.Sequential):
+    r"""The 5-layer CNN backbone module in [TPAMI 3D-LUT]
+        (https://github.com/HuiZeng/Image-Adaptive-3DLUT).
+    Args:
+        pretrained (bool, optional): [ignored].
+        input_resolution (int, optional): Resolution for pre-downsampling. Default: 256.
+        extra_pooling (bool, optional): Whether to insert an extra pooling layer
+            at the very end of the module to reduce the number of parameters of
+            the subsequent module. Default: False.
+    """
+    def __init__(self, pretrained=False, input_resolution=256, extra_pooling=True, norm=True, shuffle=1, feat_num=16):
+        self.shuffle = shuffle
+        body = [
+            BasicBlockT(3 * (shuffle ** 2), feat_num, stride=2, norm=norm),
+            BasicBlockT(feat_num, feat_num*2, stride=2, norm=norm),
+            BasicBlockT(feat_num*2, feat_num*4, stride=2, norm=norm),
+            BasicBlockT(feat_num*4, feat_num*8, stride=2, norm=norm),
+            BasicBlockT(feat_num*8, feat_num*8, stride=2),
+            nn.Dropout(p=0.5),
+        ]
+        if extra_pooling:
+            body.append(nn.AdaptiveAvgPool2d(2))
+        super().__init__(*body)
+        self.input_resolution = input_resolution
+        self.out_channels = feat_num*8 * (4 if extra_pooling else 64)
+    def forward(self, imgs):
+        imgs = F.pixel_unshuffle(imgs, self.shuffle)
+        # imgs = F.interpolate(imgs, size=(self.input_resolution,) * 2,
+        #     mode='bilinear', align_corners=False)
+        return super().forward(imgs).view(imgs.shape[0], -1)
+
+def deactivate_batchnorm(m):
+    if isinstance(m, nn.BatchNorm2d):
+        m.reset_parameters()
+        m.eval()
+        with torch.no_grad():
+            m.weight.fill_(1.0)
+            m.bias.zero_()
+            
+class resnet18_224_2(nn.Module):
+    def __init__(self, out_dim=1152, res_size=256, norm=0, shuffle=1, arg=0):
+        super(resnet18_224_2, self).__init__()
+        net = TPAMIBackbone(input_resolution=res_size, norm=norm,shuffle=shuffle, feat_num=arg.feat_num)
+        if res_size == 0:
+            self.upsample = nn.Identity()
+        else:
+            self.upsample = nn.Upsample(size=(res_size, res_size), mode='bilinear')
+        if norm == 0:
+            net.apply(deactivate_batchnorm)
+        self.model = net
+        fc_node1 = 512
+        res_node = 512 * (arg.feat_num // 16)
+        lists = []
+        lists += [nn.Linear(res_node, fc_node1), nn.ReLU(), nn.Linear(fc_node1, out_dim)]
+        self.fc = nn.Sequential(*lists)
+        initialize_weights_part(self.fc[0])
+        torch.nn.init.constant_(self.fc[2].weight.data, 0)
+        torch.nn.init.constant_(self.fc[2].bias.data, 1)
+    def forward(self, x):
+        x = self.upsample(x)
+        if self.res_num != -5:
+            f = self.model(x)
+            f1 = self.fc(f)
+            return f1
+        else:
+            f, _ = self.model(x)
+            f = self.fc(f)
+            return f
+def initialize_weights_part(net):
+    for m in net.modules():
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            nn.init.kaiming_normal_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.weight, 1.0)
+            nn.init.constant_(m.bias, 0.0)
+
+
 class adaptive_implicit_trans(nn.Module):
-    def __init__(self, mode=0, category_num=1, arg=0):
-        super(adaptive_implicit_trans, self).__init__() 
+    def __init__(self, category_num=1, arg=0):
+        super(adaptive_implicit_trans, self).__init__()
         if arg.random_filter == 1:
             self.it_weights = nn.Parameter(torch.rand(64*category_num, 1, 1, 1), requires_grad=False)
         else:
@@ -114,19 +198,18 @@ class adaptive_implicit_trans(nn.Module):
             for i in range(0,category_num):
                 self.it_weights[i*64] = 1
         self.it_weights.requires_grad = True
-
         self.register_buffer('kernel', self.initialize_kernel())
-        self.mode = mode
         self.category_num = category_num
         self.concat_mode = arg.concat_mode
+        self.reduce_conv = nn.Conv2d(64 * self.category_num, 64, kernel_size=1)
+
         if self.concat_mode == 2:
             self.gap = nn.AdaptiveAvgPool2d((1, 1))
             self.fc1 = nn.Linear((self.category_num) * 64, 64)
+            self.fc1 = nn.Linear(64, 64)
             self.relu1 = nn.ReLU()
-            self.fc2 = nn.Linear(64, 64 * (self.category_num))
-            self.sigmoid = nn.Sigmoid()     
-        
-
+            self.fc2 = nn.Linear(64, 64)
+            self.sigmoid = nn.Sigmoid()
     def initialize_kernel(self):
         conv_shape = (64, 64, 1, 1)
         kernel = torch.zeros(conv_shape)
@@ -148,46 +231,32 @@ class adaptive_implicit_trans(nn.Module):
 
     def forward(self, x, backbone):
         N, C, H, W = x.size()
-        if self.mode == 'IDCT':
-            # no meaning
-            #kernel = self.kernel * self.it_weights
-            kernel = self.kernel.repeat((self.category_num),1,1,1) * self.it_weights
-            x = F.conv2d(x, kernel, padding='same', groups=1)
-            x = x.reshape(N, self.category_num, C, H, W)
-            #x = torch.sum(x, dim=1)
-
-        elif self.mode == 'backbone':  
-            x = x.reshape(1, N * C, H, W)
-            weight_list = self.it_weights.reshape(1, self.category_num, 64)
-            weight_list = weight_list.repeat(N,1,1)
-            backbone_temp = backbone.unsqueeze(2)
-
-            backbone_params = backbone_temp * weight_list
-
-            if self.concat_mode == 0:
-                backbone_params = torch.sum(backbone_params, dim=1)
-                backbone_params = backbone_params.reshape(N * 64, 1, 1, 1)
-                kernel = self.kernel.repeat(N,1,1,1) * backbone_params
-                x = F.conv2d(input=x, weight=kernel, padding='same', groups=N)
-                x = x.reshape(N, C, H, W)
-            else:
-                backbone_params = backbone_params.reshape(N * 64 * (self.category_num), 1, 1, 1)
-                kernel = self.kernel.repeat(N * (self.category_num), 1,1,1) * backbone_params
-                x = F.conv2d(input=x, weight=kernel, padding='same', groups=N)
-                x = x.reshape(N, C * (self.category_num), H, W)
-
-                if self.concat_mode == 2:
-                    x_f = self.gap(x)
-                    x_f = x_f.reshape(N, -1)
-                    x_f = self.sigmoid(self.fc2(self.relu1(self.fc1(x_f))))
-                    x_f = x_f.reshape(N, C * (self.category_num), 1, 1)
-                    x = (x_f + 1) * x
-
-            #z = x6 - x
-            #x = torch.sum(x, dim=1)
-            #
+        x = x.reshape(1, N * C, H, W)
+        weight_list = self.it_weights.reshape(1, self.category_num, 64)
+        weight_list = weight_list.repeat(N,1,1)
+        backbone_temp = backbone.unsqueeze(1)
+        backbone_params = backbone_temp * weight_list
+        if self.concat_mode == 0:
+            backbone_params = torch.sum(backbone_params, dim=1)
+            backbone_params = backbone_params.reshape(N * 64, 1, 1, 1)
+            kernel = self.kernel.repeat(N,1,1,1) * backbone_params
+            x = F.conv2d(input=x, weight=kernel, padding='same', groups=N)
+            x = x.reshape(N, C, H, W)
+        else:
+            backbone_params = backbone_params.reshape(N * 64 * (self.category_num), 1, 1, 1)
+            kernel = self.kernel.repeat(N * (self.category_num), 1,1,1) * backbone_params
+            x = F.conv2d(input=x, weight=kernel, padding='same', groups=N)
+            x = x.reshape(N, C * (self.category_num), H, W)
+            x = self.reduce_conv(x)
+            if self.concat_mode == 2:
+                x_f = self.gap(x)
+                x_f = x_f.reshape(N, -1)
+                x_f = self.sigmoid(self.fc2(self.relu1(self.fc1(x_f))))
+                x_f = x_f.reshape(N, C, 1, 1)
+                x = (x_f + 1) * x
         return x
     
+
 class conv(nn.Module):
     def __init__(self, in_channel, out_channel, kernel_size, dilation_rate=1, padding=0, stride=1):
         super(conv, self).__init__()
@@ -198,44 +267,10 @@ class conv(nn.Module):
         out = self.conv(x_input)
         return out
 
-
-class conv_relu(nn.Module):
-    def __init__(self, in_channel, out_channel, kernel_size, dilation_rate=1, padding=0, stride=1):
-        super(conv_relu, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels=in_channel, out_channels=out_channel, kernel_size=kernel_size, stride=stride,
-                      padding=padding, bias=True, dilation=dilation_rate),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x_input):
-        out = self.conv(x_input)
-        return out
     
-class DB(nn.Module):
-    def __init__(self, in_channel, d_list, inter_num):
-        super(DB, self).__init__()
-        self.d_list = d_list
-        self.conv_layers = nn.ModuleList()
-        c = in_channel
-        for i in range(len(d_list)):
-            dense_conv = conv_relu(in_channel=c, out_channel=inter_num, kernel_size=3, dilation_rate=d_list[i],
-                                   padding=d_list[i])
-            self.conv_layers.append(dense_conv)
-            c = c + inter_num
-        self.conv_post = conv(in_channel=c, out_channel=in_channel, kernel_size=1)
-
-    def forward(self, x):
-        t = x
-        for conv_layer in self.conv_layers:
-            _t = conv_layer(t)
-            t = torch.cat([_t, t], dim=1)
-        t = self.conv_post(t)
-        return t
-    
-class IDCT(nn.Module):
+class DCT(nn.Module):
     def __init__(self):
-        super(IDCT, self).__init__()
+        super(DCT, self).__init__()
         self.register_buffer('kernel', self.initialize_kernel())
 
     def initialize_kernel(self):
@@ -243,79 +278,23 @@ class IDCT(nn.Module):
         kernel = torch.zeros(conv_shape)
         r1 = sqrt(1.0 / 8)
         r2 = sqrt(2.0 / 8)
-        for i in range(8):
-            _u = 2 * i + 1
-            for j in range(8):
-                _v = 2 * j + 1
-                index = i * 8 + j
-                for u in range(8):
-                    for v in range(8):
-                        index2 = u * 8 + v
-                        t = cos(_u * u * pi / 16) * cos(_v * v * pi / 16)
+
+        for u in range(8):
+            for v in range(8):
+                index = u * 8 + v
+                _u = 2 * u + 1
+                _v = 2 * v + 1
+                for i in range(8):
+                    for j in range(8):
+                        index2 = i * 8 + j
+                        t = cos(_u * i * pi / 16) * cos(_v * j * pi / 16)
                         t = t * r1 if u == 0 else t * r2
                         t = t * r1 if v == 0 else t * r2
-                        kernel[index2, index, 0, 0] = t
+                        kernel[index, index2, 0, 0] = t
         return kernel
 
     def forward(self, x):
-        kernel = self.kernel
-        x = F.conv2d(x, kernel, padding='same', groups=1)
-        return x
-    
-class bandpassFilter(nn.Module):
-    def __init__(self, in_channel, d_list, inter_num, mode='original', arg=None):
-        super(bandpassFilter, self).__init__()
-        self.basic_block = DB(in_channel=in_channel, d_list=d_list, inter_num=inter_num)
-        self.mode = mode
-
-        if arg is None:
-            arg = AdaptiveArgs()
-        
-        self.trans0 = adaptive_implicit_trans(mode=mode, arg=arg)
-        self.after_trans0 = nn.Conv2d(in_channels=64, out_channels=in_channel, kernel_size=3, padding=1)
-        self.weight0 = nn.Parameter(torch.tensor(0.1), requires_grad=True)
-        self.conv_post0 = nn.Conv2d(in_channels=in_channel, out_channels=64, kernel_size=1, padding=0)
-
-        self.residual = arg.residual
-        self.FSL = arg.FSL
-
-        # learnable gamma
-        self.gamma = nn.Parameter(torch.tensor(1.0), requires_grad=True)
-
-    def forward(self, x, backbone=None):
-        x_0 = x
-        y_0 = self.basic_block(x_0)
-
-        if self.mode != 'original' and backbone is not None:
-            # C_M1
-            y_0 = self.conv_post0(y_0)
-            # IDCT
-            y_0 = self.trans0(y_0, backbone[:, :64])
-            # C_M2
-            y_0 = self.after_trans0(y_0)
-            if self.FSL == 1:
-                y_0 = y_0 * self.weight0
-
-        if self.residual == 0:
-            out = y_0
-        else:
-            out = x + y_0
-
-        # clean / moire 분리 (gamma로 조절)
-        clean = out / self.gamma
-        moire = x - clean
-
-        # loss
-        # reconstruction consistency
-        recon_loss = (x - (clean + moire)).abs().mean()
-        # gamma regularization (L2)
-        gamma_reg = (self.gamma - 1).pow(2).mean()
-        # clean/moire 크기 제어
-        sep_loss = clean.abs().mean() + moire.abs().mean()
-
-        loss = sep_loss + 0.01 * gamma_reg + 0.1 * recon_loss
-
-        return clean, moire, loss
+        return F.conv2d(x, self.kernel, padding='same', groups=1)
 
 
 class PCDAlignment(nn.Module):
@@ -354,7 +333,7 @@ class PCDAlignment(nn.Module):
             level = f'l{i}'
             offset = torch.cat([nbr_feat_l[i - 1], ref_feat_l[i - 1]], dim=1)
             if offset.shape[1] != self.offset_conv1[level].in_channels:
-                offset = F.pad(offset, (0, 0, 0, 0, 0, self.offset_conv1[level].in_channels - offset.shape[1])) # ✅ 개선: 채널 수 맞추기
+                offset = F.pad(offset, (0, 0, 0, 0, 0, self.offset_conv1[level].in_channels - offset.shape[1])) 
             offset = self.lrelu(self.offset_conv1[level](offset))
             if i == 3:
                 offset = self.lrelu(self.offset_conv2[level](offset))
@@ -385,9 +364,10 @@ class PCDAlignment(nn.Module):
 class DemoireNet(nn.Module):
     def __init__(self, num_feat=64):
         super(DemoireNet, self).__init__()
-        # extract
-        self.feat_extract = nn.Conv2d(3, num_feat // 4, 3, 1, 1)
-        
+
+        arg = AdaptiveArgs()
+        self.rank_weight = 1e-3
+
         # demoireing
         self.down1 = nn.Conv2d(num_feat, num_feat // 4, 3, 1, 1)
         self.demoire1_1 = DilatedBlock(in_channel=num_feat, d_list=(1, 2, 3, 2, 1), num_feat=num_feat)
@@ -396,9 +376,17 @@ class DemoireNet(nn.Module):
         self.down3 = nn.Conv2d(num_feat, num_feat // 4, 3, 1, 1)
         self.demoire3_1 = DilatedBlock(in_channel=num_feat, d_list=(1, 2, 3, 2, 1), num_feat=num_feat)
 
-        self.moire_sep1 = bandpassFilter(num_feat, d_list=(1,2,3,2,1), inter_num=num_feat//2)
-        self.moire_sep2 = bandpassFilter(num_feat, d_list=(1,2,3,2,1), inter_num=num_feat//2)
-        self.moire_sep3 = bandpassFilter(num_feat, d_list=(1,2,3,2,1), inter_num=num_feat//2)
+        self.moire_sep1 = adaptive_implicit_trans(category_num=4, arg=arg)
+        self.moire_sep2 = adaptive_implicit_trans(category_num=4, arg=arg)
+        self.moire_sep3 = adaptive_implicit_trans(category_num=4, arg=arg)
+
+        # extract
+        self.feat_extract = nn.Conv2d(3, num_feat // 4, 3, 1, 1)
+
+        # gamma
+        self.gamma1 = nn.Parameter(torch.ones(1, num_feat, 1, 1))
+        self.gamma2 = nn.Parameter(torch.ones(1, num_feat, 1, 1))
+        self.gamma3 = nn.Parameter(torch.ones(1, num_feat, 1, 1))
 
         # refinement
         self.refine1 = ConvBlock(num_feat, 3)
@@ -430,39 +418,56 @@ class DemoireNet(nn.Module):
         x = x[:, 1, :, :, :].view(b, c, h, w)  # remove adjacent frames
         return x
 
-    def forward(self, x, return_intermediate=False):
+    def forward(self, x, gt=None):
         b, t, c, h, w = x.size()
         x = x.view(-1, c, h, w)
         feat_0 = self.pus(self.feat_extract(x))
         
         # demoireing
         feat_l1 = self.pus(self.down1(feat_0))       
-
-        clean1, moire1, loss1 = self.moire_sep1(feat_l1)
-
-        feat_l1 = self.demoire1_1(clean1)  
+        backbone1 = torch.mean(feat_l1, dim=(2, 3))
+        moire1 = self.moire_sep1(feat_l1, backbone1)
+        clean1 = (feat_l1 - moire1) * self.gamma1
+        # feat_l1 = self.demoire1_1(clean1)
 
         feat_l2 = self.pus(self.down2(feat_l1))
-        clean2, moire2, loss2 = self.moire_sep2(feat_l2)
-        feat_l2 = self.demoire2_1(clean2)
+        backbone2 = torch.mean(feat_l2, dim=(2, 3))
+        moire2 = self.moire_sep2(feat_l2, backbone2)
+        clean2 = (feat_l2 - moire2) * self.gamma2
+        # feat_l2 = self.demoire2_1(clean2)
 
         feat_l3 = self.pus(self.down3(feat_l2))
-        clean3, moire3, loss3 = self.moire_sep3(feat_l3)
-        feat_l3 = self.demoire3_1(clean3)
+        backbone3 = torch.mean(feat_l3, dim=(2, 3))
+        moire3 = self.moire_sep3(feat_l3, backbone3)
+        clean3 = (feat_l3 - moire3) * self.gamma3
+        # feat_l3 = self.demoire3_1(clean3)
         
         # refinement
         feat_l1 = self.refine1(feat_l1)
         feat_l2 = self.refine2(feat_l2)
         feat_l3 = self.refine3(feat_l3)
 
-        # loss
-        total_loss = loss1 + loss2 + loss3
-
+        """
+        loss1 = self.lowrank_loss(moire1)
+        loss2 = self.lowrank_loss(moire2)
+        loss3 = self.lowrank_loss(moire3)
+        loss_lowrank = loss1 + loss2 + loss3
+        total_loss = loss_lowrank
+        """
         _, _, H1, W1 = clean1.shape
         clean1 = self.remove_adjacent_frames(clean1.view(b, t, -1, H1, W1))
         moire1 = self.remove_adjacent_frames(moire1.view(b, t, -1, H1, W1))
 
-        return feat_l1, feat_l2, feat_l3, clean1, moire1, total_loss
+        return feat_l1, feat_l2, feat_l3, clean1, moire1
+
+    def lowrank_loss(self, x):
+        B, C, H, W = x.shape
+        x = x.view(B * C, H * W)
+        try:
+            _, S, _ = torch.linalg.svd(x, full_matrices=False)
+        except RuntimeError:
+            S = torch.zeros((min(H * W, B * C)), device=x.device)
+        return self.rank_weight * S.sum()
 
 
 @ARCH_REGISTRY.register()        
